@@ -106,7 +106,7 @@ export async function runInit(opts: InitOptions, images: ResolvedImages): Promis
   run(
     `${rt} run -d` +
     ` --name ${CONTAINER}` +
-    ` --network ${INTERNAL_NET}` +
+    ` --network ${runtime.defaultNetwork}` +
     ` -p ${HOST_PORT}:3000` +
     ` -v ${VOLUME}:/data` +
     ` -v ${runtime.socketPath}:/var/run/docker.sock` +
@@ -115,7 +115,7 @@ export async function runInit(opts: InitOptions, images: ResolvedImages): Promis
     ` ${IMAGE}`,
   );
 
-  runSilent(`${rt} network connect ${runtime.defaultNetwork} ${CONTAINER}`);
+  runSilent(`${rt} network connect ${INTERNAL_NET} ${CONTAINER}`);
 
   console.log();
   console.log(green(`[OK] Huddle is running at http://localhost:${HOST_PORT}`));
