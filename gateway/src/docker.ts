@@ -5,8 +5,17 @@ import { createContainerProxy } from './socket-proxy';
 import { saveCredentials, getSetting, listFolderMappings } from './db';
 import { getCaCertPem } from './tls-ca';
 import { ensureWorktree } from './worktree';
+import { sanitizeResolvConf } from './dns-egress';
 
 const SOCKET_DIR = '/tmp/dc-sockets';
+
+// De CLI geeft de gedetecteerde container-engine door via HUDDLE_RUNTIME. Bij
+// (rootless) Podman is de per-container proxy-socket SELinux-gelabeld; een
+// SELinux-confined devcontainer mag hem dan niet benaderen. `label=disable` op
+// de devcontainer heft die confinement op zodat DOCKER_HOST/de socket werken.
+// (Docker/Docker Desktop hebben dit niet nodig.)
+const CONTAINER_RUNTIME = process.env.HUDDLE_RUNTIME ?? 'docker';
+const RUNTIME_SECURITY_OPT: string[] = CONTAINER_RUNTIME === 'podman' ? ['label=disable'] : [];
 
 // ── IP → container name cache (used by proxy) ────────────────────────────────
 
@@ -356,10 +365,16 @@ export async function buildImage(imageName: string, dockerfilePath: string): Pro
 
 export async function connectNetwork(networkName: string, containerName: string): Promise<void> {
   await dockerRequest('POST', `/networks/${encodeURIComponent(networkName)}/connect`, { Container: containerName });
+  // Koppelt de gateway zelf een (internal) devcontainer-net bij, dan zet Podman
+  // de aardvark-DNS van dat net vooraan in resolv.conf — die faalt op externe
+  // namen. Herstel de volgorde zodat egress blijft werken (zie dns-egress.ts).
+  if (containerName === 'huddle') await sanitizeResolvConf();
 }
 
 export async function disconnectNetwork(networkName: string, containerName: string): Promise<void> {
   await dockerRequest('POST', `/networks/${encodeURIComponent(networkName)}/disconnect`, { Container: containerName });
+  // Ook een disconnect laat Podman resolv.conf opnieuw genereren.
+  if (containerName === 'huddle') await sanitizeResolvConf();
 }
 
 export async function deleteNetwork(name: string): Promise<void> {
@@ -668,6 +683,19 @@ export async function createAndStartContainer(params: StartParams): Promise<stri
 
   const password = crypto.randomBytes(12).toString('base64url');
 
+  try {
+    const existing = await inspectContainer(containerName);
+    const existingIde = existing?.Config?.Labels?.['com.devcontainer.ide'] ?? ideFromContainerLabels(existing?.Config?.Labels);
+    throw new Error(
+      `Container '${containerName}' bestaat al${existingIde ? ` (${existingIde})` : ''}. ` +
+      `Verwijder die container eerst of kies een andere naam met --name.`
+    );
+  } catch (err: any) {
+    if (!String(err.message).includes(`Docker API GET /containers/${encodeURIComponent(containerName)}/json → 404:`)) {
+      throw err;
+    }
+  }
+
   const netName = `dc-net-${containerName}`;
   if (!(await networkExists(netName))) {
     await createNetwork(netName);
@@ -675,7 +703,10 @@ export async function createAndStartContainer(params: StartParams): Promise<stri
   try {
     await connectNetwork(netName, 'huddle');
   } catch (err: any) {
-    if (!String(err.message).includes('already exists in network')) throw err;
+    // Al gekoppeld is geen fout. Docker en Podman formuleren dit verschillend:
+    // Docker → "already exists in network", Podman → "network is already connected".
+    const msg = String(err.message);
+    if (!msg.includes('already exists in network') && !msg.includes('already connected')) throw err;
   }
 
   if (!(await imageExists(imageName))) {
@@ -778,6 +809,7 @@ export async function createAndStartContainer(params: StartParams): Promise<stri
       Mounts: mounts,
       NetworkMode: netName,
       CapAdd: ['NET_ADMIN'],
+      ...(RUNTIME_SECURITY_OPT.length ? { SecurityOpt: RUNTIME_SECURITY_OPT } : {}),
       Memory: parseMemoryBytes(params.memory || getSetting('defaultMemory') || '8g'),
       CpuQuota: parseCpuQuota(params.cpus || getSetting('defaultCpus') || '2'),
       CpuPeriod: 100000,
